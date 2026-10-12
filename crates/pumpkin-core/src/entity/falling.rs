@@ -1,11 +1,14 @@
 use pumpkin_data::Block;
+use pumpkin_data::BlockId;
 use pumpkin_data::BlockState;
 use pumpkin_data::BlockStateId;
 use pumpkin_data::damage::DamageType;
 use pumpkin_data::entity::EntityType;
+use pumpkin_data::game_event::GameEvent;
 use pumpkin_data::item::Item;
 use pumpkin_data::item_stack::ItemStack;
 use pumpkin_data::tag::{self, Taggable};
+use pumpkin_data::world::WorldEvent;
 use pumpkin_protocol::bedrock::client::CUpdateBlock;
 use pumpkin_protocol::java::client::play::CBlockUpdate;
 use pumpkin_util::math::position::BlockPos;
@@ -85,7 +88,21 @@ impl EntityBase for FallingEntity {
                     None,
                     None,
                 ) && !would_continue_falling;
-                if may_replace && would_survive {
+                // Vanilla brushable blocks (suspicious sand/gravel) start falling with
+                // cancelDrop set, so on landing they always break instead of placing:
+                // level event 2001 carries the break sound and particles, and no loot
+                // drops (FallingBlockEntity.tick discard + onBrokenAfterFall).
+                if shatters_on_landing(block) {
+                    world.sync_world_event(
+                        WorldEvent::ParticlesAndSoundDestroyBlock,
+                        landing_pos,
+                        i32::from(state_id.as_u16()),
+                    );
+                    world.emit_game_event(
+                        GameEvent::BlockDestroy.name(),
+                        landing_pos.to_centered_f64(),
+                    );
+                } else if may_replace && would_survive {
                     if block.has_tag(&tag::Block::MINECRAFT_CONCRETE_POWDERS)
                         && FallingBlock::should_solidify(&**world, &landing_pos)
                         && let Some(name) = block.name.strip_suffix("_powder")
@@ -142,5 +159,32 @@ impl EntityBase for FallingEntity {
 
     fn cast_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+fn shatters_on_landing(block: &Block) -> bool {
+    block.id == BlockId::SUSPICIOUS_SAND || block.id == BlockId::SUSPICIOUS_GRAVEL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suspicious_blocks_shatter_on_landing() {
+        assert!(shatters_on_landing(&Block::SUSPICIOUS_SAND));
+        assert!(shatters_on_landing(&Block::SUSPICIOUS_GRAVEL));
+    }
+
+    #[test]
+    fn ordinary_falling_blocks_place_themselves() {
+        for block in [
+            &Block::SAND,
+            &Block::GRAVEL,
+            &Block::RED_SAND,
+            &Block::WHITE_CONCRETE_POWDER,
+        ] {
+            assert!(!shatters_on_landing(block));
+        }
     }
 }
