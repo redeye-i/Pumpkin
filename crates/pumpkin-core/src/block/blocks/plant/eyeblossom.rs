@@ -7,6 +7,7 @@ use pumpkin_data::{
     particle::Particle,
     sound::{Sound, SoundCategory},
 };
+use pumpkin_protocol::java::client::play::CParticle;
 use pumpkin_util::{
     Difficulty,
     math::{position::BlockPos, vector3::Vector3},
@@ -24,6 +25,8 @@ use crate::{
 
 const EYEBLOSSOM_XZ_RANGE: i32 = 3;
 const EYEBLOSSOM_Y_RANGE: i32 = 2;
+const OPEN_EYEBLOSSOM_PARTICLE_COLOR: i32 = 16_545_810;
+const CLOSED_EYEBLOSSOM_PARTICLE_COLOR: i32 = 6_250_335;
 
 pub struct EyeblossomBlock;
 
@@ -114,6 +117,18 @@ impl BlockBehaviour for EyeblossomBlock {
 
 impl PlantBlockBase for EyeblossomBlock {}
 
+fn encode_trail_particle_data(target: Vector3<f64>, color: i32, duration: u8) -> Vec<u8> {
+    let mut data = Vec::with_capacity(29);
+    data.extend_from_slice(&target.x.to_be_bytes());
+    data.extend_from_slice(&target.y.to_be_bytes());
+    data.extend_from_slice(&target.z.to_be_bytes());
+    data.extend_from_slice(&color.to_be_bytes());
+    // Trail's duration is a VarInt; eyeblossom durations are 10..30 ticks, so their
+    // encoding is always one byte.
+    data.push(duration);
+    data
+}
+
 pub fn try_changing_state(world: &Arc<World>, current_block: &Block, pos: &BlockPos) -> bool {
     let is_open = current_block == &Block::OPEN_EYEBLOSSOM;
     let should_be_open = world.eyeblossom_open(pos).unwrap_or(is_open);
@@ -130,15 +145,36 @@ pub fn try_changing_state(world: &Arc<World>, current_block: &Block, pos: &Block
 
     world.set_block_state(pos, new_block.default_state.id, BlockFlags::NOTIFY_ALL);
 
-    world.spawn_particle(
-        pos.to_centered_f64(),
+    let center = pos.to_centered_f64();
+    let mut rng = rand::rng();
+    let distance = 0.5 + rng.random::<f64>();
+    let target = Vector3::new(
+        center.x + (rng.random::<f64>() - 0.5) * distance,
+        center.y + (rng.random::<f64>() + 1.0) * distance,
+        center.z + (rng.random::<f64>() - 0.5) * distance,
+    );
+    let color = if is_open {
+        CLOSED_EYEBLOSSOM_PARTICLE_COLOR
+    } else {
+        OPEN_EYEBLOSSOM_PARTICLE_COLOR
+    };
+    let duration = (20.0 * distance) as u8;
+    let data = encode_trail_particle_data(target, color, duration);
+    let particle = CParticle::new(
+        false,
+        false,
+        center,
         Vector3::new(0.0, 0.0, 0.0),
         0.0,
         1,
-        Particle::Trail,
+        (Particle::Trail as i32).into(),
+        &data,
     );
 
-    let mut rng = rand::rng();
+    for player in world.players.load().iter() {
+        player.try_send_client_packet(&particle);
+    }
+
     for dx in -EYEBLOSSOM_XZ_RANGE..=EYEBLOSSOM_XZ_RANGE {
         for dy in -EYEBLOSSOM_Y_RANGE..=EYEBLOSSOM_Y_RANGE {
             for dz in -EYEBLOSSOM_XZ_RANGE..=EYEBLOSSOM_XZ_RANGE {
@@ -169,4 +205,24 @@ pub fn try_changing_state(world: &Arc<World>, current_block: &Block, pos: &Block
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_trail_particle_data;
+    use pumpkin_util::math::vector3::Vector3;
+
+    #[test]
+    fn trail_particle_data_matches_protocol_layout() {
+        let target = Vector3::new(1.25, 64.5, -3.75);
+        let color = 0x12_34_56;
+
+        let data = encode_trail_particle_data(target, color, 20);
+        assert_eq!(data.len(), 29);
+        assert_eq!(&data[0..8], &target.x.to_be_bytes());
+        assert_eq!(&data[8..16], &target.y.to_be_bytes());
+        assert_eq!(&data[16..24], &target.z.to_be_bytes());
+        assert_eq!(&data[24..28], &color.to_be_bytes());
+        assert_eq!(data[28], 20);
+    }
 }
