@@ -60,6 +60,9 @@ pub mod play;
 pub mod recipe_helper;
 pub mod status;
 
+#[cfg(test)]
+mod lifetime_tests;
+
 pub use chunk_data::{CChunkData, ChunkLightExt};
 use outgoing::{DISCONNECT_FLUSH_TIMEOUT, OutgoingPacket, run_outgoing_packet_writer};
 
@@ -94,8 +97,8 @@ pub struct JavaClient {
     pub address: SocketAddr,
     /// The client's brand or modpack information. Lock-free `ArcSwap`.
     pub brand: ArcSwap<Option<String>>,
-    /// Associated player reference. Lock-free `ArcSwap`.
-    pub player: ArcSwap<Option<Arc<Player>>>,
+    /// Non-owning player reference: the player owns this client.
+    pub player: ArcSwap<std::sync::Weak<Player>>,
     /// A collection of tasks associated with this client. The tasks await completion when removing the client.
     tasks: TaskTracker,
     rt_handle: tokio::runtime::Handle,
@@ -161,7 +164,7 @@ impl JavaClient {
             network_writer: std::sync::Mutex::new(Some(pending.network_writer)),
             network_reader: std::sync::Mutex::new(Some(pending.network_reader)),
             brand: ArcSwap::from_pointee(pending.brand),
-            player: ArcSwap::from_pointee(None),
+            player: ArcSwap::from_pointee(std::sync::Weak::new()),
             wait_for_keep_alive: AtomicBool::new(false),
             received_movement_this_tick: AtomicBool::new(false),
             keep_alive_id: AtomicCell::new(0),
@@ -201,8 +204,8 @@ impl JavaClient {
         }
     }
 
-    pub fn set_player(&self, player: Arc<Player>) {
-        self.player.store(Arc::new(Some(player)));
+    pub fn set_player(&self, player: &Arc<Player>) {
+        self.player.store(Arc::new(Arc::downgrade(player)));
     }
 
     pub async fn progress_player_packets(&self, player: &Arc<Player>, server: &Arc<Server>) {
@@ -328,8 +331,7 @@ impl JavaClient {
     }
 
     pub async fn send_chunks(&self, chunks: &[SyncChunk]) {
-        let player = self.player.load_full();
-        let Some(player) = player.as_ref() else {
+        let Some(player) = self.player.load().upgrade() else {
             return;
         };
         let Some(server) = player.world().server.upgrade() else {
@@ -433,8 +435,7 @@ impl JavaClient {
             return Some(packet_data);
         }
         // TODO: packets sent before `set_player` (e.g. an `add_player` kick) go out untranslated.
-        let player = self.player.load_full();
-        let Some(player) = player.as_ref() else {
+        let Some(player) = self.player.load().upgrade() else {
             return Some(packet_data);
         };
         let Some(server) = player.world().server.upgrade() else {
@@ -449,7 +450,7 @@ impl JavaClient {
             return Some(packet_data);
         };
         let payload = packet_data.slice(packet_data.len() - reader.len()..);
-        let mut event = PacketSentEvent::new_raw(player.clone(), packet_id.0, payload);
+        let mut event = PacketSentEvent::new_raw(player, packet_id.0, payload);
         server.plugin_manager.fire_blocking(&server, &mut event);
         if event.cancelled {
             return None;
